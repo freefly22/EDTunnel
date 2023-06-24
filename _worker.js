@@ -1,4 +1,4 @@
-// <!--GAMFC-->version base on commit c17ceb86be8e16c53fcfdf4b7dcd09e9e372863b, time is 2023-06-05 18:02:59 UTC<!--GAMFC-END-->.
+// <!--GAMFC-->version base on commit 43fad05dcdae3b723c53c226f8181fc5bd47223e, time is 2023-06-22 15:20:02 UTC<!--GAMFC-END-->.
 // @ts-ignore
 import { connect } from 'cloudflare:sockets';
 
@@ -6,7 +6,9 @@ import { connect } from 'cloudflare:sockets';
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
-let proxyIP = "64.68.192." + Math.floor(Math.random() * 255);
+let proxyIP = 'cdn.xn--b6gac.eu.org';
+
+let dohURL = 'https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg='; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
 
 if (!isValidUUID(userID)) {
 	throw new Error('uuid is not valid');
@@ -15,7 +17,7 @@ if (!isValidUUID(userID)) {
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, PROXYIP: string}} env
+	 * @param {{UUID: string, PROXYIP: string, DNS_RESOLVER_URL: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
@@ -23,6 +25,7 @@ export default {
 		try {
 			userID = env.UUID || userID;
 			proxyIP = env.PROXYIP || proxyIP;
+			dohURL = env.DNS_RESOLVER_URL || dohURL;
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
 				const url = new URL(request.url);
@@ -80,13 +83,14 @@ async function vlessOverWSHandler(request) {
 	let remoteSocketWapper = {
 		value: null,
 	};
+	let udpStreamWrite = null;
 	let isDns = false;
 
 	// ws --> remote
 	readableWebSocketStream.pipeTo(new WritableStream({
 		async write(chunk, controller) {
-			if (isDns) {
-				return await handleDNSQuery(chunk, webSocket, null, log);
+			if (isDns && udpStreamWrite) {
+				return udpStreamWrite(chunk);
 			}
 			if (remoteSocketWapper.value) {
 				const writer = remoteSocketWapper.value.writable.getWriter()
@@ -127,8 +131,12 @@ async function vlessOverWSHandler(request) {
 			const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
 			const rawClientData = chunk.slice(rawDataIndex);
 
+			// TODO: support udp here when cf runtime has udp support
 			if (isDns) {
-				return handleDNSQuery(rawClientData, webSocket, vlessResponseHeader, log);
+				const { write } = await handleUDPOutBound(webSocket, vlessResponseHeader, log);
+				udpStreamWrite = write;
+				udpStreamWrite(rawClientData);
+				return;
 			}
 			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
 		},
@@ -514,54 +522,77 @@ function stringify(arr, offset = 0) {
 	return uuid;
 }
 
+
 /**
  * 
- * @param {ArrayBuffer} udpChunk 
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
  * @param {ArrayBuffer} vlessResponseHeader 
  * @param {(string)=> void} log 
  */
-async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
-	// no matter which DNS server client send, we alwasy use hard code one.
-	// beacsue someof DNS server is not support DNS over TCP
-	try {
-		const dnsServer = '8.8.4.4'; // change to 1.1.1.1 after cf fix connect own ip bug
-		const dnsPort = 53;
-		/** @type {ArrayBuffer | null} */
-		let vlessHeader = vlessResponseHeader;
-		/** @type {import("@cloudflare/workers-types").Socket} */
-		const tcpSocket = connect({
-			hostname: dnsServer,
-			port: dnsPort,
-		});
+async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
 
-		log(`connected to ${dnsServer}:${dnsPort}`);
-		const writer = tcpSocket.writable.getWriter();
-		await writer.write(udpChunk);
-		writer.releaseLock();
-		await tcpSocket.readable.pipeTo(new WritableStream({
-			async write(chunk) {
-				if (webSocket.readyState === WS_READY_STATE_OPEN) {
-					if (vlessHeader) {
-						webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-						vlessHeader = null;
-					} else {
-						webSocket.send(chunk);
-					}
+	let isVlessHeaderSent = false;
+	const transformStream = new TransformStream({
+		start(controller) {
+
+		},
+		transform(chunk, controller) {
+			// udp message 2 byte is the the length of udp data
+			// TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+			for (let index = 0; index < chunk.byteLength;) {
+				const lengthBuffer = chunk.slice(index, index + 2);
+				const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+				const udpData = new Uint8Array(
+					chunk.slice(index + 2, index + 2 + udpPakcetLength)
+				);
+				index = index + 2 + udpPakcetLength;
+				controller.enqueue(udpData);
+			}
+		},
+		flush(controller) {
+		}
+	});
+
+	// only handle dns udp for now
+	transformStream.readable.pipeTo(new WritableStream({
+		async write(chunk) {
+			const resp = await fetch(dohURL, // dns server url
+				{
+					method: 'POST',
+					headers: {
+						'content-type': 'application/dns-message',
+					},
+					body: chunk,
+				})
+			const dnsQueryResult = await resp.arrayBuffer();
+			const udpSize = dnsQueryResult.byteLength;
+			// console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
+			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+			if (webSocket.readyState === WS_READY_STATE_OPEN) {
+				log(`doh success and dns message length is ${udpSize}`);
+				if (isVlessHeaderSent) {
+					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+				} else {
+					webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+					isVlessHeaderSent = true;
 				}
-			},
-			close() {
-				log(`dns server(${dnsServer}) tcp is close`);
-			},
-			abort(reason) {
-				console.error(`dns server(${dnsServer}) tcp is abort`, reason);
-			},
-		}));
-	} catch (error) {
-		console.error(
-			`handleDNSQuery have exception, error: ${error.message}`
-		);
-	}
+			}
+		}
+	})).catch((error) => {
+		log('dns udp has error' + error)
+	});
+
+	const writer = transformStream.writable.getWriter();
+
+	return {
+		/**
+		 * 
+		 * @param {Uint8Array} chunk 
+		 */
+		write(chunk) {
+			writer.write(chunk);
+		}
+	};
 }
 
 /**
@@ -599,4 +630,3 @@ clash-meta
 ################################################################
 `;
 }
-
